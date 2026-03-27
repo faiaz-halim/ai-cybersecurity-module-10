@@ -6,11 +6,15 @@ from ollama import Client
 logger = logging.getLogger(__name__)
 
 # Defaults
-OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434") 
+OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_MODEL = "qwen3:0.6b"
 
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL)
-ollama.pull(OLLAMA_MODEL)
+try:
+    ollama.pull(OLLAMA_MODEL)
+except Exception:
+    pass
+
 
 def query_llm(prompt, model=DEFAULT_MODEL, system_instruction=None, tools=None):
     """
@@ -49,10 +53,7 @@ def query_llm(prompt, model=DEFAULT_MODEL, system_instruction=None, tools=None):
         else:
             # Use Generate API for standard text generation (legacy support)
             response = client.generate(
-                model=model,
-                prompt=prompt,
-                system=system_instruction,
-                stream=False
+                model=model, prompt=prompt, system=system_instruction, stream=False
             )
             return response.get("response", "")
 
@@ -60,7 +61,9 @@ def query_llm(prompt, model=DEFAULT_MODEL, system_instruction=None, tools=None):
         logger.error(f"LLM Query Error: {e}")
         # Basic check for connection errors since we switched libraries
         if "connect" in str(e).lower():
-            error_msg = "Error: Could not connect to local Ollama instance. Is it running?"
+            error_msg = (
+                "Error: Could not connect to local Ollama instance. Is it running?"
+            )
         else:
             error_msg = f"Error generating response: {str(e)}"
 

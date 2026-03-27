@@ -14,3 +14,5 @@ wheels/
 
 # notebook stuff
 .ipynb_checkpoints
+
+.opencode

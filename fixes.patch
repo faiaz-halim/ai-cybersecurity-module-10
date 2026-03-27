@@ -1,0 +1,236 @@
+diff --git a/vulnerable_archive/archiver/templates/archiver/view_archive.html b/vulnerable_archive/archiver/templates/archiver/view_archive.html
+index 2b920aa..5527393 100644
+--- a/vulnerable_archive/archiver/templates/archiver/view_archive.html
++++ b/vulnerable_archive/archiver/templates/archiver/view_archive.html
+@@ -25,14 +25,14 @@
+ 
+                 <h3>Notes</h3>
+                 <div class="alert alert-light border">
+-                    {{ archive.notes|safe }}
++                    {{ archive.notes }}
+                 </div>
+ 
+                 <hr>
+ 
+                 <h3>Archived Content (Vulnerable to XSS)</h3>
+                 <div class="border p-3 bg-white">
+-                    {{ archive.content|safe }}
++                    {{ archive.content }}
+                 </div>
+             </div>
+             <div class="card-footer">
+diff --git a/vulnerable_archive/archiver/views.py b/vulnerable_archive/archiver/views.py
+index 261ef92..d86bccf 100644
+--- a/vulnerable_archive/archiver/views.py
++++ b/vulnerable_archive/archiver/views.py
+@@ -37,7 +37,8 @@ def dashboard(request):
+ 
+ @login_required
+ def generate_token(request):
+-    SECRET = "do_not_share_this"
++    import os, secrets
++    SECRET = os.environ.get("JWT_SECRET", secrets.token_hex(32))
+ 
+     payload = {
+         "user_id": request.user.id,
+@@ -66,7 +67,17 @@ def add_archive(request):
+         notes = request.POST.get("notes")
+ 
+         if url:
++            import socket, ipaddress
++            from urllib.parse import urlparse
+             try:
++                parsed_url = urlparse(url)
++                if parsed_url.hostname:
++                    try:
++                        ip = socket.gethostbyname(parsed_url.hostname)
++                        if ipaddress.ip_address(ip).is_private or ipaddress.ip_address(ip).is_loopback:
++                            raise ValueError("Access to internal network is prohibited.")
++                    except socket.gaierror:
++                        pass
+                 response = requests.get(url, timeout=10)
+                 title = "No Title Found"
+                 if "<title>" in response.text:
+@@ -79,12 +90,13 @@ def add_archive(request):
+                     except IndexError:
+                         pass
+ 
++                from django.utils.html import escape
+                 Archive.objects.create(
+                     user=request.user,
+                     url=url,
+-                    title=title,
+-                    content=response.text,
+-                    notes=notes,
++                    title=escape(title),
++                    content=escape(response.text),
++                    notes=escape(notes) if notes else "",
+                 )
+                 messages.success(request, "URL archived successfully!")
+                 return redirect("archive_list")
+@@ -96,13 +108,13 @@ def add_archive(request):
+ 
+ @login_required
+ def view_archive(request, archive_id):
+-    archive = get_object_or_404(Archive, pk=archive_id)
++    archive = get_object_or_404(Archive, pk=archive_id, user=request.user)
+     return render(request, "archiver/view_archive.html", {"archive": archive})
+ 
+ 
+ @login_required
+ def edit_archive(request, archive_id):
+-    archive = get_object_or_404(Archive, pk=archive_id)
++    archive = get_object_or_404(Archive, pk=archive_id, user=request.user)
+ 
+     if request.method == "POST":
+         archive.notes = request.POST.get("notes")
+@@ -115,7 +127,7 @@ def edit_archive(request, archive_id):
+ 
+ @login_required
+ def delete_archive(request, archive_id):
+-    archive = get_object_or_404(Archive, pk=archive_id)
++    archive = get_object_or_404(Archive, pk=archive_id, user=request.user)
+ 
+     if request.method == "POST":
+         archive.delete()
+@@ -131,15 +143,11 @@ def search_archives(request):
+     results = []
+ 
+     if query:
+-        sql = f"SELECT archiver_archive.*, auth_user.username FROM archiver_archive JOIN auth_user ON archiver_archive.user_id = auth_user.id WHERE archiver_archive.user_id = {request.user.id} AND title LIKE '%{query}%'"
+-
+         try:
+-            with connection.cursor() as cursor:
+-                cursor.execute(sql)
+-                columns = [col[0] for col in cursor.description]
+-                results = [dict(zip(columns, row)) for row in cursor.fetchall()]
++            archives = Archive.objects.select_related('user').filter(user=request.user, title__icontains=query)
++            results = [{"id": a.id, "title": a.title, "url": a.url, "content": a.content, "notes": a.notes, "created_at": a.created_at, "user_id": a.user_id, "username": a.user.username} for a in archives]
+         except Exception as e:
+-            messages.error(request, f"SQL Error: {str(e)}")
++            messages.error(request, f"Query Error: {str(e)}")
+ 
+     return render(request, "archiver/search.html", {"results": results, "query": query})
+ 
+@@ -151,6 +159,9 @@ def ask_database(request):
+     user_input = request.POST.get("prompt", "")
+ 
+     if request.method == "POST" and user_input:
++        forbidden_phrases = ["ignore previous", "system prompt", "forget all", "disregard", "you are now"]
++        if any(f in user_input.lower() for f in forbidden_phrases):
++            return render(request, "archiver/ask_database.html", {"answer": "Prompt injection detected.", "prompt": user_input, "sql_query": "BLOCKED"})
+         # Schema info for the LLM
+         schema_info = """
+         Table: archiver_archive
+@@ -175,17 +186,22 @@ def ask_database(request):
+         elif "```" in sql_query:
+             sql_query = sql_query.split("```")[1].strip()
+ 
+-        try:
+-            with connection.cursor() as cursor:
+-                cursor.execute(sql_query)
+-                if cursor.description:
+-                    columns = [col[0] for col in cursor.description]
+-                    results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+-                    answer = results
+-                else:
+-                    answer = "Query executed successfully (no results returned)."
+-        except Exception as e:
+-            answer = f"Error executing SQL: {str(e)}"
++        sql_upper = sql_query.upper()
++        forbidden = ["UNION", "JOIN", "AUTH_USER", "DJANGO_SESSION", "SQLITE_MASTER", ";", "--"]
++        if not sql_upper.strip().startswith("SELECT") or any(f in sql_upper for f in forbidden):
++            answer = "Error: Invalid or dangerous SQL query generated."
++        else:
++            try:
++                with connection.cursor() as cursor:
++                    cursor.execute(sql_query)
++                    if cursor.description:
++                        columns = [col[0] for col in cursor.description]
++                        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
++                        answer = results
++                    else:
++                        answer = "Query executed successfully (no results returned)."
++            except Exception as e:
++                answer = f"Error executing SQL: {str(e)}"
+ 
+     return render(
+         request,
+@@ -227,21 +243,29 @@ def export_summary(request):
+                     file_path = parts[1].strip()
+ 
+         file_path = file_path.strip("'\"")
+-
+-        try:
+-            with open(file_path, "w") as f:
+-                f.write(summary_content)
+-
+-            messages.success(request, f"Summary written to: {file_path}")
+-        except Exception as e:
+-            messages.error(request, f"File Write Error: {str(e)}")
++        import os
++        safe_filename = os.path.basename(file_path).lstrip("/\\")
++        if not safe_filename: safe_filename = "default.txt"
++        base_dir = os.path.abspath("exported_summaries")
++        safe_path = os.path.abspath(os.path.join(base_dir, safe_filename))
++        
++        if not safe_path.startswith(base_dir):
++            messages.error(request, "Path Traversal detected.")
++        else:
++            try:
++                os.makedirs(base_dir, exist_ok=True)
++                with open(safe_path, "w") as f:
++                    f.write(summary_content)
++                messages.success(request, f"Summary written to: {safe_path}")
++            except Exception as e:
++                messages.error(request, f"File Write Error: {str(e)}")
+ 
+     return render(request, "archiver/export_summary.html")
+ 
+ 
+ @login_required
+ def enrich_archive(request, archive_id):
+-    archive = get_object_or_404(Archive, pk=archive_id)
++    archive = get_object_or_404(Archive, pk=archive_id, user=request.user)
+     llm_response = None
+ 
+     if request.method == "POST":
+@@ -295,7 +319,17 @@ def enrich_archive(request, archive_id):
+             for tool in tool_calls:
+                 if tool["function"]["name"] == "fetch_url":
+                     url_to_fetch = tool["function"]["arguments"]["url"]
++                    import socket, ipaddress
++                    from urllib.parse import urlparse
+                     try:
++                        parsed_url = urlparse(url_to_fetch)
++                        if parsed_url.hostname:
++                            try:
++                                ip = socket.gethostbyname(parsed_url.hostname)
++                                if ipaddress.ip_address(ip).is_private or ipaddress.ip_address(ip).is_loopback:
++                                    raise ValueError("Access to internal network is prohibited.")
++                            except socket.gaierror:
++                                pass
+                         requests.get(url_to_fetch, timeout=5)
+                         llm_response += f"Successfully fetched: {url_to_fetch}\n"
+                     except Exception as e:
+diff --git a/vulnerable_archive/vulnerable_archive/settings.py b/vulnerable_archive/vulnerable_archive/settings.py
+index f2fdaec..e8719df 100644
+--- a/vulnerable_archive/vulnerable_archive/settings.py
++++ b/vulnerable_archive/vulnerable_archive/settings.py
+@@ -20,12 +20,13 @@ BASE_DIR = Path(__file__).resolve().parent.parent
+ # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
+ 
+ # SECURITY WARNING: keep the secret key used in production secret!
+-SECRET_KEY = "django-insecure-^3!*dt2xq2vs7+5%)j2&ii@h6tz5sq@mtkji--%2c!4ye2$lhm"
++import os, secrets
++SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_urlsafe(50))
+ 
+ # SECURITY WARNING: don't run with debug turned on in production!
+-DEBUG = True
++DEBUG = os.environ.get('DEBUG', 'False').lower() == 'true'
+ 
+-ALLOWED_HOSTS = []
++ALLOWED_HOSTS = ["*"]
+ 
+ 
+ # Application definition
