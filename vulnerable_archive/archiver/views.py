@@ -37,7 +37,9 @@ def dashboard(request):
 
 @login_required
 def generate_token(request):
-    SECRET = "do_not_share_this"
+    import os, secrets
+
+    SECRET = os.environ.get("JWT_SECRET", secrets.token_hex(32))
 
     payload = {
         "user_id": request.user.id,
@@ -66,7 +68,23 @@ def add_archive(request):
         notes = request.POST.get("notes")
 
         if url:
+            import socket, ipaddress
+            from urllib.parse import urlparse
+
             try:
+                parsed_url = urlparse(url)
+                if parsed_url.hostname:
+                    try:
+                        ip = socket.gethostbyname(parsed_url.hostname)
+                        if (
+                            ipaddress.ip_address(ip).is_private
+                            or ipaddress.ip_address(ip).is_loopback
+                        ):
+                            raise ValueError(
+                                "Access to internal network is prohibited."
+                            )
+                    except socket.gaierror:
+                        pass
                 response = requests.get(url, timeout=10)
                 title = "No Title Found"
                 if "<title>" in response.text:
@@ -79,12 +97,14 @@ def add_archive(request):
                     except IndexError:
                         pass
 
+                from django.utils.html import escape
+
                 Archive.objects.create(
                     user=request.user,
                     url=url,
-                    title=title,
-                    content=response.text,
-                    notes=notes,
+                    title=escape(title),
+                    content=escape(response.text),
+                    notes=escape(notes) if notes else "",
                 )
                 messages.success(request, "URL archived successfully!")
                 return redirect("archive_list")
@@ -96,13 +116,13 @@ def add_archive(request):
 
 @login_required
 def view_archive(request, archive_id):
-    archive = get_object_or_404(Archive, pk=archive_id)
+    archive = get_object_or_404(Archive, pk=archive_id, user=request.user)
     return render(request, "archiver/view_archive.html", {"archive": archive})
 
 
 @login_required
 def edit_archive(request, archive_id):
-    archive = get_object_or_404(Archive, pk=archive_id)
+    archive = get_object_or_404(Archive, pk=archive_id, user=request.user)
 
     if request.method == "POST":
         archive.notes = request.POST.get("notes")
@@ -115,7 +135,7 @@ def edit_archive(request, archive_id):
 
 @login_required
 def delete_archive(request, archive_id):
-    archive = get_object_or_404(Archive, pk=archive_id)
+    archive = get_object_or_404(Archive, pk=archive_id, user=request.user)
 
     if request.method == "POST":
         archive.delete()
@@ -131,15 +151,25 @@ def search_archives(request):
     results = []
 
     if query:
-        sql = f"SELECT archiver_archive.*, auth_user.username FROM archiver_archive JOIN auth_user ON archiver_archive.user_id = auth_user.id WHERE archiver_archive.user_id = {request.user.id} AND title LIKE '%{query}%'"
-
         try:
-            with connection.cursor() as cursor:
-                cursor.execute(sql)
-                columns = [col[0] for col in cursor.description]
-                results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+            archives = Archive.objects.select_related("user").filter(
+                user=request.user, title__icontains=query
+            )
+            results = [
+                {
+                    "id": a.id,
+                    "title": a.title,
+                    "url": a.url,
+                    "content": a.content,
+                    "notes": a.notes,
+                    "created_at": a.created_at,
+                    "user_id": a.user_id,
+                    "username": a.user.username,
+                }
+                for a in archives
+            ]
         except Exception as e:
-            messages.error(request, f"SQL Error: {str(e)}")
+            messages.error(request, f"Query Error: {str(e)}")
 
     return render(request, "archiver/search.html", {"results": results, "query": query})
 
@@ -151,41 +181,65 @@ def ask_database(request):
     user_input = request.POST.get("prompt", "")
 
     if request.method == "POST" and user_input:
-        # Schema info for the LLM
-        schema_info = """
-        Table: archiver_archive
-        Columns: id, title, url, content, notes, created_at, user_id
+        forbidden_phrases = [
+            "ignore previous",
+            "system prompt",
+            "forget all",
+            "disregard",
+            "you are now",
+        ]
+        if any(f in user_input.lower() for f in forbidden_phrases):
+            return render(
+                request,
+                "archiver/ask_database.html",
+                {
+                    "answer": "Prompt injection detected.",
+                    "prompt": user_input,
+                    "sql_query": "BLOCKED",
+                },
+            )
+
+        system_prompt = """
+        You are a database assistant. Map the user intent to one of the pre-canned queries.
+        1. RECENT: Get the latest archives.
+        2. SEARCH: Search archives by a keyword.
+        3. COUNT: Get the total number of archives.
+        4. UNKNOWN: Unknown intent.
+
+        Return ONLY valid JSON: {"intent": "...", "keyword": "..."}
         """
 
-        system_prompt = f"""
-        You are a SQL expert. Convert the user's natural language query into a raw SQLite SQL query.
-        The table name is 'archiver_archive'.
-        Do not explain. Return ONLY the SQL query.
-        Current User ID: {request.user.id}
-        Schema:
-        {schema_info}
-        """
-
-        # Get SQL from LLM
-        sql_query = query_llm(user_input, system_instruction=system_prompt).strip()
-
-        # Clean up markdown code blocks if present
-        if "```sql" in sql_query:
-            sql_query = sql_query.split("```sql")[1].split("```")[0].strip()
-        elif "```" in sql_query:
-            sql_query = sql_query.split("```")[1].strip()
+        response_json = query_llm(user_input, system_instruction=system_prompt).strip()
+        sql_query = f"LLM Intent Response: {response_json}"
 
         try:
-            with connection.cursor() as cursor:
-                cursor.execute(sql_query)
-                if cursor.description:
-                    columns = [col[0] for col in cursor.description]
-                    results = [dict(zip(columns, row)) for row in cursor.fetchall()]
-                    answer = results
-                else:
-                    answer = "Query executed successfully (no results returned)."
+            import json
+
+            if not response_json.startswith("{"):
+                raise ValueError("LLM returned non-JSON format.")
+
+            data = json.loads(response_json)
+            intent = data.get("intent", "UNKNOWN")
+
+            if intent == "RECENT":
+                archives = Archive.objects.filter(user=request.user).order_by(
+                    "-created_at"
+                )[:5]
+                answer = [{"Title": a.title, "Date": a.created_at} for a in archives]
+            elif intent == "SEARCH":
+                keyword = data.get("keyword", "")
+                archives = Archive.objects.filter(
+                    user=request.user, title__icontains=keyword
+                )
+                answer = [{"Title": a.title, "URL": a.url} for a in archives]
+            elif intent == "COUNT":
+                count = Archive.objects.filter(user=request.user).count()
+                answer = [{"Total Archives": count}]
+            else:
+                answer = "Error: Invalid or dangerous SQL query generated."
+
         except Exception as e:
-            answer = f"Error executing SQL: {str(e)}"
+            answer = "Error: Invalid or dangerous SQL query generated."
 
     return render(
         request,
@@ -204,44 +258,29 @@ def export_summary(request):
         content_prompt = f"Write a short summary about: {topic}"
         summary_content = query_llm(content_prompt)
 
-        # Prompt for LLM to determine filename
-        path_prompt = f"""
-        Generate a filename for a summary about '{topic}'.
-        The user suggested: '{filename_hint}'.
-        Return ONLY the full file path.
-        Base directory is: ./exported_summaries/
-        """
-        file_path = query_llm(path_prompt).strip()
+        import uuid, os
 
-        # Clean up if LLM wraps in quotes or code blocks
-        if "```" in file_path:
-            import re
+        safe_filename = f"{uuid.uuid4().hex}.txt"
+        base_dir = os.path.abspath("exported_summaries")
+        safe_path = os.path.abspath(os.path.join(base_dir, safe_filename))
 
-            match = re.search(r"```(?:\w+)?\s*(.*?)\s*```", file_path, re.DOTALL)
-            if match:
-                file_path = match.group(1).strip()
-            else:
-                # Fallback if regex fails or structure is weird
-                parts = file_path.split("```")
-                if len(parts) > 1:
-                    file_path = parts[1].strip()
-
-        file_path = file_path.strip("'\"")
-
-        try:
-            with open(file_path, "w") as f:
-                f.write(summary_content)
-
-            messages.success(request, f"Summary written to: {file_path}")
-        except Exception as e:
-            messages.error(request, f"File Write Error: {str(e)}")
+        if not safe_path.startswith(base_dir):
+            messages.error(request, "Path Traversal detected.")
+        else:
+            try:
+                os.makedirs(base_dir, exist_ok=True)
+                with open(safe_path, "w") as f:
+                    f.write(summary_content)
+                messages.success(request, f"Summary written to: {safe_path}")
+            except Exception as e:
+                messages.error(request, f"File Write Error: {str(e)}")
 
     return render(request, "archiver/export_summary.html")
 
 
 @login_required
 def enrich_archive(request, archive_id):
-    archive = get_object_or_404(Archive, pk=archive_id)
+    archive = get_object_or_404(Archive, pk=archive_id, user=request.user)
     llm_response = None
 
     if request.method == "POST":
@@ -259,9 +298,6 @@ def enrich_archive(request, archive_id):
 
         Archive Content:
         {archive.content}
-
-        Archive Notes:
-        {archive.notes}
         """
 
         tools = [
@@ -295,7 +331,23 @@ def enrich_archive(request, archive_id):
             for tool in tool_calls:
                 if tool["function"]["name"] == "fetch_url":
                     url_to_fetch = tool["function"]["arguments"]["url"]
+                    import socket, ipaddress
+                    from urllib.parse import urlparse
+
                     try:
+                        parsed_url = urlparse(url_to_fetch)
+                        if parsed_url.hostname:
+                            try:
+                                ip = socket.gethostbyname(parsed_url.hostname)
+                                if (
+                                    ipaddress.ip_address(ip).is_private
+                                    or ipaddress.ip_address(ip).is_loopback
+                                ):
+                                    raise ValueError(
+                                        "Access to internal network is prohibited."
+                                    )
+                            except socket.gaierror:
+                                pass
                         requests.get(url_to_fetch, timeout=5)
                         llm_response += f"Successfully fetched: {url_to_fetch}\n"
                     except Exception as e:
